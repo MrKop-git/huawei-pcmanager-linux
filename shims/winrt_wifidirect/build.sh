@@ -27,7 +27,7 @@ build() {   # $1=工具链前缀 $2=输出名
   # HSTRING 那套（WindowsCreateString / WindowsGetStringRawBuffer）在
   # api-ms-win-core-winrt-string-l1-1-0.dll，mingw 里由 -lruntimeobject 或
   # -lwindowsapp 提供；两个都带上，缺哪个由链接器挑。
-  "$cc" -O2 -shared -Wall -Wextra -Wno-unused-parameter \
+  "$cc" -O2 -shared -Wall -Wextra -Wno-unused-parameter -Werror \
         -o "$out" windows.devices.wifidirect.c "$def" \
         -lole32 -lruntimeobject -lwindowsapp -static-libgcc 2>&1 || {
     echo "  首次链接失败，去掉 -lwindowsapp 重试…"

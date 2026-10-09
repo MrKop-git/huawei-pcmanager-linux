@@ -159,11 +159,17 @@ static int wait_state(char *state, size_t cap)
 /* WinRT 对象的公共头：vtable 指针 + 引用计数 */
 #define RT_HEAD const void *lpVtbl; LONG ref;
 
-static ULONG rt_AddRef(const void *self) { return (ULONG)InterlockedIncrement((LONG*)&((const LONG*)self)[1]); }
-static ULONG rt_Release(const void *self, void (*dtor)(void*))
+/* ★ 坑（踩过）：不要用 ((LONG*)self)[1] 取 ref —— x64 上 lpVtbl 占 8 字节，
+ *   ref 在偏移 8 而不是 4。那样等于每次 AddRef/Release 都在改 lpVtbl 的高 4 字节，
+ *   虚表指针被写坏，之后一跳就是 page fault（表现为"崩在 combase 里"）。
+ *   老老实实用结构体取字段。 */
+typedef struct RTHead { const void *lpVtbl; LONG ref; } RTHead;
+
+static ULONG rt_AddRef(void *self) { return (ULONG)InterlockedIncrement(&((RTHead*)self)->ref); }
+static ULONG rt_Release(void *self, void (*dtor)(void*))
 {
-    LONG n = InterlockedDecrement((LONG*)&((const LONG*)self)[1]);
-    if (n == 0 && dtor) dtor((void*)self);
+    LONG n = InterlockedDecrement(&((RTHead*)self)->ref);
+    if (n == 0 && dtor) dtor(self);
     return (ULONG)n;
 }
 
