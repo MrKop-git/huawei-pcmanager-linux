@@ -23,3 +23,7 @@ pcm-wine/
 # Python
 __pycache__/
 *.py[cod]
+
+# mingw 生成的导出表（由 build.sh 生成）
+*.def
+*.o

@@ -127,6 +127,49 @@ PCManager/HwMdcCenter.exe
 
 效果：主程序启动成功，越过了这个崩溃。
 
+### 2.6 主程序界面"一个字都没有"（★ 有个陷阱）
+
+现象：窗口、图标、卡片图片**全都正常**，但**所有动态文字全缺**（导航栏只有图标、按钮只有图标）。
+
+排查：`WINEDEBUG=+font` 显示程序要的是 `Microsoft YaHei`，Wine 也确实替换到了 `Noto Sans CJK SC`（1259 次），而且 `Noto Sans CJK SC` **确实注册进了族列表**。
+→ **字体没问题。**
+
+**真凶是 2.3 里为修安装器皮肤装的那个微软原生 `gdiplus`。** 原生 gdiplus 在 Wine 里画文字会失败。
+
+```bash
+wine reg add 'HKCU\Software\Wine\DllOverrides' /v gdiplus /d builtin /f
+```
+
+效果：文字立刻全部出现。
+
+> **⚠️ 冲突**：安装器皮肤要 **原生** gdiplus，主程序文字要 **builtin** gdiplus，两者不能同时满足。
+> 实操上：**装的时候用原生，装完切回 builtin**。
+
+### 2.7 窗口透明度不对
+
+界面是 **DuiLib** 写的（国产窗口库）。`PCManager.exe` 导入：
+
+```
+DuiLib::CPaintManagerUI::SetBlurMode(HWND, AccentState, ...)
+DuiLib::CControlUI::SetBlur(int)
+SetWindowCompositionAttribute     ← DuiLib.dll / DllControl.dll / UIControl.dll
+```
+
+毛玻璃走的是微软**未公开**的 `SetWindowCompositionAttribute` + `AccentState`
+（`ACCENT_ENABLE_ACRYLICBLURBEHIND`）。**Wine 没实现它** → 模糊做不出来，
+但窗口仍按"背后有模糊层"来画 → 半透明、把桌面透出来。
+
+**解法**：关掉 DuiLib 的 blur。窗口定义在 `res/layout/*.xml`：
+
+```xml
+<Window size="1024,640" ... blur="true">   ← 改成 false
+```
+
+工具： [`../scripts/patch-duilib-blur.sh`](../scripts/patch-duilib-blur.sh)（12 个 layout 文件，自动备份 `.orig`）。
+
+> 注意：这是**改过的程序文件**，电脑管家自我修复/重装会覆盖，需要重跑。
+
+
 ---
 
 ## 3. 当前战场：`wlanapi.dll`
