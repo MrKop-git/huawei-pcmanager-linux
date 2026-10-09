@@ -132,6 +132,23 @@ static BOOL WINAPI my_SetServiceStatus(SERVICE_STATUS_HANDLE h, LPSERVICE_STATUS
                (unsigned long)st->dwCurrentState, (unsigned long)st->dwWin32ExitCode,
                (unsigned long)st->dwCheckPoint);
     (void)h;
+
+    /* ★ 谁调的？失败分支里会 SetServiceStatus(STOPPED)，把返回地址抓出来
+     *   就能定位是 ServiceMain 的哪条分支（我们没法读它自己的日志）。 */
+    {
+        typedef USHORT (WINAPI *pRtlCaptureStackBackTrace)(ULONG, ULONG, PVOID*, PULONG);
+        static pRtlCaptureStackBackTrace cap;
+        if (!cap) {
+            HMODULE nt = GetModuleHandleA("ntdll.dll");
+            if (nt) cap = (pRtlCaptureStackBackTrace)(void*)GetProcAddress(nt, "RtlCaptureStackBackTrace");
+        }
+        if (cap) {
+            PVOID fr[8] = {0};
+            USHORT n = cap(1, 8, fr, NULL);      /* 跳过第 0 帧（就是这里） */
+            for (USHORT i = 0; i < n; ++i)
+                lg("[scdw]     ↖ 调用者[%u] = 0x%p", (unsigned)i, fr[i]);
+        }
+    }
     return TRUE;
 }
 
