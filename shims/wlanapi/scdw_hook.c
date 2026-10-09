@@ -29,21 +29,82 @@
 
 #include <windows.h>
 #include <winsvc.h>
-#include <stdio.h>
-#include <string.h>
+#include <stdarg.h>
 
-/* ---------------------------------------------------------------- 日志 */
+/* ---------------------------------------------------------------- 日志
+ *
+ * ★ 故意**不用 CRT 的 printf** —— 这条日志会从 DllMain、钩子、以及被
+ *   我们接管的服务初始化路径里调用，全都发生在 CRT 状态可能不干净的时机。
+ *   实测过一次崩溃栈：[0..2] ucrtbase、[3][4] 我们自己 —— 像 printf 机制炸。
+ *   这里只用 Win32（CreateFile/WriteFile）+ 手写格式化，零 CRT 依赖。
+ */
 
-static FILE *g_log;
+static HANDLE g_log;
+static char   g_line[1024];
+
+static void put_str(char *dst, int *n, const char *s)
+{
+    for (; s && *s && *n < (int)sizeof(g_line) - 1; ++s) dst[(*n)++] = *s;
+}
+static void put_wstr(char *dst, int *n, const WCHAR *s)
+{
+    for (; s && *s && *n < (int)sizeof(g_line) - 1; ++s)
+        dst[(*n)++] = (*s < 0x80) ? (char)*s : '?';
+}
+static void put_ulong(char *dst, int *n, unsigned long v, int base)
+{
+    char t[32]; int i = 0;
+    if (v == 0) t[i++] = '0';
+    while (v) { unsigned d = v % base; t[i++] = (char)(d < 10 ? '0'+d : 'a'+d-10); v /= base; }
+    while (i > 0 && *n < (int)sizeof(g_line) - 1) dst[(*n)++] = t[--i];
+}
+
 static void lg(const char *fmt, ...)
 {
     if (!g_log) {
-        const char *p = getenv("SCDW_HOOK_LOG");
-        g_log = fopen(p && *p ? p : "C:\\scdw_hook.log", "a");
-        if (!g_log) return;
+        g_log = CreateFileA("C:\\scdw_hook.log",
+                            FILE_APPEND_DATA,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE,
+                            NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (g_log == INVALID_HANDLE_VALUE) { g_log = NULL; return; }
     }
-    va_list ap; va_start(ap, fmt); vfprintf(g_log, fmt, ap); va_end(ap);
-    fputc('\n', g_log); fflush(g_log);
+
+    int n = 0;
+    va_list ap; va_start(ap, fmt);
+    for (const char *f = fmt; *f && n < (int)sizeof(g_line) - 1; ++f) {
+        if (*f != '%') { g_line[n++] = *f; continue; }
+        ++f;
+        int lng = 0;
+        while (*f == 'l') { ++lng; ++f; }
+        switch (*f) {
+        case 's': {
+            if (lng) put_wstr(g_line, &n, va_arg(ap, const WCHAR*));
+            else      put_str (g_line, &n, va_arg(ap, const char*));
+            break; }
+        case 'd': {
+            long v = lng ? va_arg(ap, long) : (long)va_arg(ap, int);
+            if (v < 0) { g_line[n++] = '-'; v = -v; }
+            put_ulong(g_line, &n, (unsigned long)v, 10); break; }
+        case 'u': put_ulong(g_line, &n, lng ? va_arg(ap, unsigned long)
+                                             : (unsigned long)va_arg(ap, unsigned), 10); break;
+        case 'x': put_ulong(g_line, &n, lng ? va_arg(ap, unsigned long)
+                                             : (unsigned long)va_arg(ap, unsigned), 16); break;
+        case 'p': g_line[n++] = '0'; g_line[n++] = 'x';
+                  put_ulong(g_line, &n, (unsigned long)(ULONG_PTR)va_arg(ap, void*), 16); break;
+        case '%': g_line[n++] = '%'; break;
+        default:  g_line[n++] = *f; break;
+        }
+    }
+    va_end(ap);
+
+    if (n < (int)sizeof(g_line) - 1) g_line[n++] = '\n';
+    g_line[n] = 0;
+
+    /* ★ 两条腿都走：写文件（给用户看）+ OutputDebugString（Wine 会把它打进
+     *   和它自己消息同一条流，顺序真实、不会丢）。
+     *   踩过：只写文件时，多进程 append 会让人误把"没写进去"当成"崩在这里"。 */
+    OutputDebugStringA(g_line);
+    if (g_log) { DWORD w = 0; WriteFile(g_log, g_line, (DWORD)n, &w, NULL); }
 }
 
 /* ------------------------------------------------------- 我们的实现 */
@@ -82,19 +143,52 @@ static BOOL WINAPI my_StartServiceCtrlDispatcherW(LPSERVICE_TABLE_ENTRYW table)
 
     if (!table) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
 
-    int n = 0;
-    for (LPSERVICE_TABLE_ENTRYW e = table; e->lpServiceName; ++e) {
-        lg("[scdw]   表项[%d] 服务名=\"%ls\" ServiceMain=%p",
-           n, e->lpServiceName, (void*)e->lpServiceProc);
-        ++n;
+    /* ★★★ 关键：**不能"读到 NULL 为止"**。
+     *
+     * 实测这个 exe 的服务表**没有 NULL 终止符** —— 表项后面紧跟着的是
+     * .rdata 里别的字符串。按 NULL 遍历会读到 0x53205d6e69616d5b
+     * （小端解出来是 ASCII 的 "[main] S"）当成指针去解引用，读到地址 -1 → 崩。
+     *
+     * Wine 的 StartServiceCtrlDispatcherW 正是这么崩的 —— 而且它崩的
+     * 那个 rcx 值和我们这里读到的垃圾完全一致。
+     *
+     * 所以改成**校验名字指针是不是落在主模块的映射范围内**，
+     * 不是就当表结束。 */
+    HMODULE me = GetModuleHandleW(NULL);
+    ULONG_PTR lo = (ULONG_PTR)me, hi = lo;
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER*)lo;
+    if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+        IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS*)((BYTE*)lo + dos->e_lfanew);
+        if (nt->Signature == IMAGE_NT_SIGNATURE)
+            hi = lo + nt->OptionalHeader.SizeOfImage;
     }
+    lg("[scdw] 主模块范围 0x%p - 0x%p", (void*)lo, (void*)hi);
+
+    int n = 0;
+    lg("[scdw] 第一遍：遍历服务表（带指针校验）");
+    for (LPSERVICE_TABLE_ENTRYW e = table; ; ++e) {
+        ULONG_PTR np = (ULONG_PTR)e->lpServiceName;
+        ULONG_PTR pp = (ULONG_PTR)e->lpServiceProc;
+        if (!np || !pp) { lg("[scdw]   遇到 NULL，表结束"); break; }
+        if (np < lo || np >= hi) {
+            lg("[scdw]   名字指针 0x%p 不在模块范围内 -> 判定为表结束"
+               "（这个 exe 的表没有 NULL 终止符）", (void*)np);
+            break;
+        }
+        lg("[scdw]   表项[%d] 服务名=\"%ls\" ServiceMain=0x%p",
+           n, e->lpServiceName, (void*)pp);
+        ++n;
+        if (n > 32) { lg("[scdw]   !! 表项超过 32，防止跑飞，停下"); break; }
+    }
+    lg("[scdw] 第一遍结束，n=%d", n);
     if (n == 0) { SetLastError(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT); return FALSE; }
 
     /* ServiceMain 的签名是 (DWORD argc, LPWSTR *argv)。
      * 真 SCDW 传 argc=1、argv[0]=服务名。我们照做（虽然 WRE 反编译显示
      * 这个 exe 的 ServiceMain 根本不读这两个参数）。 */
-    for (LPSERVICE_TABLE_ENTRYW e = table; e->lpServiceName; ++e) {
-        if (!e->lpServiceProc) continue;
+    lg("[scdw] 第二遍：开始调 ServiceMain");
+    for (int i = 0; i < n; ++i) {
+        LPSERVICE_TABLE_ENTRYW e = &table[i];
         LPWSTR argv[2];
         argv[0] = e->lpServiceName;
         argv[1] = NULL;
@@ -126,7 +220,7 @@ static void *hook_one(HMODULE mod, const char *dllName, const char *funcName, vo
     IMAGE_IMPORT_DESCRIPTOR *imp = (IMAGE_IMPORT_DESCRIPTOR*)(base + dir->VirtualAddress);
     for (; imp->Name; ++imp) {
         const char *name = (const char*)(base + imp->Name);
-        if (_stricmp(name, dllName) != 0) continue;
+        if (lstrcmpiA(name, dllName) != 0) continue;
 
         IMAGE_THUNK_DATA *oft = imp->OriginalFirstThunk
             ? (IMAGE_THUNK_DATA*)(base + imp->OriginalFirstThunk) : NULL;
@@ -136,7 +230,7 @@ static void *hook_one(HMODULE mod, const char *dllName, const char *funcName, vo
         for (int i = 0; oft[i].u1.AddressOfData; ++i) {
             if (IMAGE_SNAP_BY_ORDINAL(oft[i].u1.Ordinal)) continue;
             IMAGE_IMPORT_BY_NAME *ibn = (IMAGE_IMPORT_BY_NAME*)(base + oft[i].u1.AddressOfData);
-            if (strcmp((const char*)ibn->Name, funcName) != 0) continue;
+            if (lstrcmpA((const char*)ibn->Name, funcName) != 0) continue;
 
             void *old = (void*)ft[i].u1.Function;
             DWORD oldprot = 0;
@@ -166,12 +260,13 @@ void scdw_hook_install(void)
     /* 只在点名的主模块里动手，免得影响同前缀下的其他服务 */
     WCHAR me[MAX_PATH] = {0};
     if (!GetModuleFileNameW(NULL, me, MAX_PATH)) return;
-    const WCHAR *base = wcsrchr(me, L'\\');
-    base = base ? base + 1 : me;
+    const WCHAR *base = me;                       /* 取文件名部分（不依赖 CRT 的 wcsrchr） */
+    for (const WCHAR *p = me; *p; ++p)
+        if (*p == (WCHAR)'\\') base = p + 1;
 
     int hit = 0;
     for (int i = 0; kTargets[i]; ++i)
-        if (_wcsicmp(base, kTargets[i]) == 0) { hit = 1; break; }
+        if (lstrcmpiW(base, kTargets[i]) == 0) { hit = 1; break; }
     if (!hit) return;
 
     HMODULE exe = GetModuleHandleW(NULL);
