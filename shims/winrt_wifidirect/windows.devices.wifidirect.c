@@ -637,6 +637,202 @@ static Factory *Factory_new(int kind)
  * 加类只需在这里加一行 + 在 install.sh 的 CLASSES 里加一行。
  * ================================================================= */
 
+/* =================================================================
+ * 两个"带自己工厂接口"的类
+ *
+ * ★ 结构上和前面几个不同：
+ *   - NetworkInformation 是**静态类**：工厂对象**不实现 IActivationFactory**，
+ *     而是把 INetworkInformationStatics 的 8 个方法直接摆在槽 6 起。
+ *     （给静态类问 IActivationFactory 本来就该是 E_NOINTERFACE。）
+ *   - PasswordCredential 没有默认构造，工厂只实现 ICredentialFactory（槽 6）。
+ *   所以这两个各要自己的工厂虚表，不能复用通用的 Factory。
+ *
+ * 语义上先给"最小可用"：
+ *   - 网络状态类方法一律返回 S_OK + NULL（"没有可用连接"），
+ *     上层多半会走降级分支；
+ *   - PasswordCredential 是纯数据容器，正常实现（存账号密码用得上）。
+ * ================================================================= */
+
+static const GUID kIID_INetworkInformationStatics = {
+    0x5074F851, 0x950D, 0x4165, { 0x9C, 0x15, 0x36, 0x56, 0x19, 0x48, 0x1E, 0xEA } };
+static const GUID kIID_ICredentialFactory = {
+    0x54EF13A1, 0xBF26, 0x47B5, { 0x97, 0xDD, 0xDE, 0x77, 0x9B, 0x7C, 0xAD, 0x58 } };
+static const GUID kIID_IPasswordCredential = {
+    0x6AB18989, 0xC720, 0x41A7, { 0xA6, 0xC1, 0xFE, 0xAD, 0xB3, 0x63, 0x29, 0xA0 } };
+
+/* ---------------- PasswordCredential（纯数据容器）---------------- */
+
+typedef struct PasswordCred {
+    RT_HEAD
+    WCHAR resource[256];
+    WCHAR user[256];
+    WCHAR pass[256];
+} PasswordCred;
+
+typedef struct PasswordCredVtbl {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(PasswordCred*, REFIID, void**);
+    ULONG   (STDMETHODCALLTYPE *AddRef)(PasswordCred*);
+    ULONG   (STDMETHODCALLTYPE *Release)(PasswordCred*);
+    HRESULT (STDMETHODCALLTYPE *GetIids)(PasswordCred*, ULONG*, IID**);
+    HRESULT (STDMETHODCALLTYPE *GetRuntimeClassName)(PasswordCred*, HSTRING*);
+    HRESULT (STDMETHODCALLTYPE *GetTrustLevel)(PasswordCred*, TrustLevel*);
+    /* 顺序照 SDK 头，勿改 */
+    HRESULT (STDMETHODCALLTYPE *get_Resource)(PasswordCred*, HSTRING*);
+    HRESULT (STDMETHODCALLTYPE *put_Resource)(PasswordCred*, HSTRING);
+    HRESULT (STDMETHODCALLTYPE *get_UserName)(PasswordCred*, HSTRING*);
+    HRESULT (STDMETHODCALLTYPE *put_UserName)(PasswordCred*, HSTRING);
+    HRESULT (STDMETHODCALLTYPE *get_Password)(PasswordCred*, HSTRING*);
+    HRESULT (STDMETHODCALLTYPE *put_Password)(PasswordCred*, HSTRING);
+    HRESULT (STDMETHODCALLTYPE *RetrievePassword)(PasswordCred*);
+    HRESULT (STDMETHODCALLTYPE *get_Properties)(PasswordCred*, void**);
+} PasswordCredVtbl;
+
+static HRESULT PC_QI(PasswordCred *s, REFIID iid, void **o)
+{
+    if (!o) return E_POINTER;
+    if (IsEqualGUID(iid, &kIID_IPasswordCredential)) { rt_AddRef(s); *o = s; return S_OK; }
+    return rt_QI(iid, &kIID_IPasswordCredential, s, o);
+}
+static ULONG PC_AddRef(PasswordCred *s) { return rt_AddRef(s); }
+static ULONG PC_Release(PasswordCred *s) { return rt_Release(s, free); }
+static HRESULT PC_GetIids(PasswordCred *s, ULONG *n, IID **i)
+{ (void)s; return rt_GetIids(&kIID_IPasswordCredential, n, i); }
+static HRESULT PC_GetRCN(PasswordCred *s, HSTRING *h)
+{ (void)s; static const WCHAR n[]=L"Windows.Security.Credentials.PasswordCredential";
+  return h ? WindowsCreateString(n,(UINT32)wcslen(n),h) : E_POINTER; }
+static HRESULT PC_GetTL(PasswordCred *s, TrustLevel *t) { (void)s; if(t)*t=BaseTrust; return S_OK; }
+
+static HRESULT PC_hget(const WCHAR *v, HSTRING *out)
+{ if(!out) return E_POINTER; return WindowsCreateString(v,(UINT32)wcslen(v),out); }
+static void PC_hput(HSTRING v, WCHAR *dst, size_t cap)
+{
+    UINT32 n=0; const WCHAR *r = v ? WindowsGetStringRawBuffer(v,&n) : NULL;
+    if (r) { wcsncpy(dst,r,cap-1); dst[cap-1]=0; } else dst[0]=0;
+}
+static HRESULT PC_get_Resource(PasswordCred *s, HSTRING *o) { return PC_hget(s->resource,o); }
+static HRESULT PC_put_Resource(PasswordCred *s, HSTRING v) { PC_hput(v,s->resource,256); lg("[wifidirect] PasswordCredential.Resource 已设"); return S_OK; }
+static HRESULT PC_get_UserName(PasswordCred *s, HSTRING *o) { return PC_hget(s->user,o); }
+static HRESULT PC_put_UserName(PasswordCred *s, HSTRING v) { PC_hput(v,s->user,256); lg("[wifidirect] PasswordCredential.UserName 已设"); return S_OK; }
+static HRESULT PC_get_Password(PasswordCred *s, HSTRING *o) { return PC_hget(s->pass,o); }
+static HRESULT PC_put_Password(PasswordCred *s, HSTRING v) { PC_hput(v,s->pass,256); lg("[wifidirect] PasswordCredential.Password 已设(%zu 字)", wcslen(s->pass)); return S_OK; }
+static HRESULT PC_RetrievePassword(PasswordCred *s) { (void)s; lg("[wifidirect] PasswordCredential.RetrievePassword"); return S_OK; }
+static HRESULT PC_get_Properties(PasswordCred *s, void **o) { (void)s; if(o)*o=NULL; return S_OK; }
+
+static const PasswordCredVtbl kPCVtbl = {
+    PC_QI, PC_AddRef, PC_Release, PC_GetIids, PC_GetRCN, PC_GetTL,
+    PC_get_Resource, PC_put_Resource,
+    PC_get_UserName, PC_put_UserName,
+    PC_get_Password, PC_put_Password,
+    PC_RetrievePassword, PC_get_Properties,
+};
+
+/* ---------------- NetworkInformation 的静态工厂 ---------------- */
+
+typedef struct NetInfoFactory { RT_HEAD } NetInfoFactory;
+
+typedef struct NetInfoStaticsVtbl {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(NetInfoFactory*, REFIID, void**);
+    ULONG   (STDMETHODCALLTYPE *AddRef)(NetInfoFactory*);
+    ULONG   (STDMETHODCALLTYPE *Release)(NetInfoFactory*);
+    HRESULT (STDMETHODCALLTYPE *GetIids)(NetInfoFactory*, ULONG*, IID**);
+    HRESULT (STDMETHODCALLTYPE *GetRuntimeClassName)(NetInfoFactory*, HSTRING*);
+    HRESULT (STDMETHODCALLTYPE *GetTrustLevel)(NetInfoFactory*, TrustLevel*);
+    /* INetworkInformationStatics 的 8 个方法，顺序照 SDK 头 */
+    HRESULT (STDMETHODCALLTYPE *GetConnectionProfiles)(NetInfoFactory*, void**);
+    HRESULT (STDMETHODCALLTYPE *GetInternetConnectionProfile)(NetInfoFactory*, void**);
+    HRESULT (STDMETHODCALLTYPE *GetLanIdentifiers)(NetInfoFactory*, void**);
+    HRESULT (STDMETHODCALLTYPE *GetHostNames)(NetInfoFactory*, void**);
+    HRESULT (STDMETHODCALLTYPE *GetProxyConfigurationAsync)(NetInfoFactory*, void*, void**);
+    HRESULT (STDMETHODCALLTYPE *GetSortedEndpointPairs)(NetInfoFactory*, void*, int, void**);
+    HRESULT (STDMETHODCALLTYPE *add_NetworkStatusChanged)(NetInfoFactory*, void*, EventRegistrationToken*);
+    HRESULT (STDMETHODCALLTYPE *remove_NetworkStatusChanged)(NetInfoFactory*, EventRegistrationToken);
+} NetInfoStaticsVtbl;
+
+static HRESULT NI_QI(NetInfoFactory *s, REFIID iid, void **o)
+{
+    if (!o) return E_POINTER;
+    if (IsEqualGUID(iid, &kIID_INetworkInformationStatics)) { rt_AddRef(s); *o = s; return S_OK; }
+    return rt_QI(iid, &kIID_INetworkInformationStatics, s, o);   /* 静态类：不认 IActivationFactory */
+}
+static ULONG NI_AddRef(NetInfoFactory *s) { return rt_AddRef(s); }
+static ULONG NI_Release(NetInfoFactory *s) { return rt_Release(s, free); }
+static HRESULT NI_GetIids(NetInfoFactory *s, ULONG *n, IID **i)
+{ (void)s; return rt_GetIids(&kIID_INetworkInformationStatics, n, i); }
+static HRESULT NI_GetRCN(NetInfoFactory *s, HSTRING *h)
+{ (void)s; static const WCHAR n[]=L"Windows.Networking.Connectivity.NetworkInformation";
+  return h ? WindowsCreateString(n,(UINT32)wcslen(n),h) : E_POINTER; }
+static HRESULT NI_GetTL(NetInfoFactory *s, TrustLevel *t) { (void)s; if(t)*t=BaseTrust; return S_OK; }
+
+/* 一律"没有可用连接"。上层多半会走降级分支 —— 这正是我们要的：
+ * 让它继续往下走，别卡在这里。真接 Linux 网络状态是后面的事。 */
+static HRESULT NI_GetConnectionProfiles(NetInfoFactory *s, void **o) { (void)s; lg("[wifidirect] NetworkInformation::GetConnectionProfiles -> 空"); if(o)*o=NULL; return S_OK; }
+static HRESULT NI_GetInternetConnectionProfile(NetInfoFactory *s, void **o) { (void)s; lg("[wifidirect] NetworkInformation::GetInternetConnectionProfile -> NULL"); if(o)*o=NULL; return S_OK; }
+static HRESULT NI_GetLanIdentifiers(NetInfoFactory *s, void **o) { (void)s; if(o)*o=NULL; return S_OK; }
+static HRESULT NI_GetHostNames(NetInfoFactory *s, void **o) { (void)s; if(o)*o=NULL; return S_OK; }
+static HRESULT NI_GetProxyConfigurationAsync(NetInfoFactory *s, void *a, void **o) { (void)s;(void)a; if(o)*o=NULL; return S_OK; }
+static HRESULT NI_GetSortedEndpointPairs(NetInfoFactory *s, void *a, int b, void **o) { (void)s;(void)a;(void)b; if(o)*o=NULL; return S_OK; }
+static HRESULT NI_add_NSC(NetInfoFactory *s, void *h, EventRegistrationToken *t)
+{ (void)s;(void)h; lg("[wifidirect] NetworkInformation::add_NetworkStatusChanged（记下，暂不回调）"); return rt_token(t); }
+static HRESULT NI_remove_NSC(NetInfoFactory *s, EventRegistrationToken t) { (void)s;(void)t; return S_OK; }
+
+static const NetInfoStaticsVtbl kNIVtbl = {
+    NI_QI, NI_AddRef, NI_Release, NI_GetIids, NI_GetRCN, NI_GetTL,
+    NI_GetConnectionProfiles, NI_GetInternetConnectionProfile,
+    NI_GetLanIdentifiers, NI_GetHostNames,
+    NI_GetProxyConfigurationAsync, NI_GetSortedEndpointPairs,
+    NI_add_NSC, NI_remove_NSC,
+};
+
+/* ---------------- PasswordCredential 的工厂（ICredentialFactory）---------------- */
+
+typedef struct CredFactory { RT_HEAD } CredFactory;
+
+typedef struct CredFactoryVtbl {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(CredFactory*, REFIID, void**);
+    ULONG   (STDMETHODCALLTYPE *AddRef)(CredFactory*);
+    ULONG   (STDMETHODCALLTYPE *Release)(CredFactory*);
+    HRESULT (STDMETHODCALLTYPE *GetIids)(CredFactory*, ULONG*, IID**);
+    HRESULT (STDMETHODCALLTYPE *GetRuntimeClassName)(CredFactory*, HSTRING*);
+    HRESULT (STDMETHODCALLTYPE *GetTrustLevel)(CredFactory*, TrustLevel*);
+    /* ICredentialFactory */
+    HRESULT (STDMETHODCALLTYPE *CreatePasswordCredential)(CredFactory*, HSTRING, HSTRING, HSTRING, void**);
+} CredFactoryVtbl;
+
+static HRESULT CF_QI(CredFactory *s, REFIID iid, void **o)
+{
+    if (!o) return E_POINTER;
+    if (IsEqualGUID(iid, &kIID_ICredentialFactory)) { rt_AddRef(s); *o = s; return S_OK; }
+    return rt_QI(iid, &kIID_ICredentialFactory, s, o);
+}
+static ULONG CF_AddRef(CredFactory *s) { return rt_AddRef(s); }
+static ULONG CF_Release(CredFactory *s) { return rt_Release(s, free); }
+static HRESULT CF_GetIids(CredFactory *s, ULONG *n, IID **i)
+{ (void)s; return rt_GetIids(&kIID_ICredentialFactory, n, i); }
+static HRESULT CF_GetRCN(CredFactory *s, HSTRING *h)
+{ (void)s; static const WCHAR n[]=L"Windows.Security.Credentials.PasswordCredential";
+  return h ? WindowsCreateString(n,(UINT32)wcslen(n),h) : E_POINTER; }
+static HRESULT CF_GetTL(CredFactory *s, TrustLevel *t) { (void)s; if(t)*t=BaseTrust; return S_OK; }
+
+static HRESULT CF_Create( CredFactory *s, HSTRING res, HSTRING usr, HSTRING pw, void **o)
+{
+    (void)s;
+    if (!o) return E_POINTER;
+    PasswordCred *p = (PasswordCred*)calloc(1, sizeof(*p));
+    if (!p) return E_OUTOFMEMORY;
+    p->lpVtbl = &kPCVtbl; p->ref = 1;
+    PC_hput(res, p->resource, 256);
+    PC_hput(usr, p->user, 256);
+    PC_hput(pw,  p->pass, 256);
+    lg("[wifidirect] CreatePasswordCredential(resource=\"%ls\", user=\"%ls\")", p->resource, p->user);
+    *o = p;
+    return S_OK;
+}
+
+static const CredFactoryVtbl kCFVtbl = {
+    CF_QI, CF_AddRef, CF_Release, CF_GetIids, CF_GetRCN, CF_GetTL,
+    CF_Create,
+};
+
 static const WCHAR *const kStubClasses[] = {
     /* 蓝牙：GATT 服务端 / 广播发布 —— 让手机发现并连上来 */
     L"Windows.Devices.Bluetooth.Advertisement.BluetoothLEAdvertisementPublisher",
@@ -648,11 +844,9 @@ static const WCHAR *const kStubClasses[] = {
     L"Windows.Devices.Bluetooth.GenericAttributeProfile.GattServiceProviderAdvertisingParameters",
     /* Wi-Fi Direct 设备对象 */
     L"Windows.Devices.WiFiDirect.WiFiDirectDevice",
-    /* 网络状态 / 热点管理 —— "开热点让手机连"要用的 */
-    L"Windows.Networking.Connectivity.NetworkInformation",
+    /* 热点管理（真正的实现等下一步） */
     L"Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager",
-    /* 凭据存储（账号密码） */
-    L"Windows.Security.Credentials.PasswordCredential",
+    /* 凭据存储（PasswordCredential 已实现；Vault 是它的容器） */
     L"Windows.Security.Credentials.PasswordVault",
     /* 数据读写 */
     L"Windows.Storage.Streams.DataReader",
@@ -683,6 +877,27 @@ HRESULT WINAPI DllGetActivationFactory(HSTRING className, IActivationFactory **f
     lg("[wifidirect] DllGetActivationFactory(\"%s\")", name);
 
     if (!raw) return CLASS_E_CLASSNOTAVAILABLE;
+
+    /* 两个"带自己工厂接口"的类：工厂对象类型与通用 Factory 不同 */
+    static const WCHAR kNetInfo[] = L"Windows.Networking.Connectivity.NetworkInformation";
+    static const WCHAR kPwdCred[] = L"Windows.Security.Credentials.PasswordCredential";
+
+    if (_wcsicmp(raw, kNetInfo) == 0) {
+        NetInfoFactory *n = (NetInfoFactory*)calloc(1, sizeof(*n));
+        if (!n) return E_OUTOFMEMORY;
+        n->lpVtbl = &kNIVtbl; n->ref = 1;
+        *factory = (IActivationFactory*)n;
+        lg("[wifidirect]   -> NetworkInformation 静态工厂已创建");
+        return S_OK;
+    }
+    if (_wcsicmp(raw, kPwdCred) == 0) {
+        CredFactory *c = (CredFactory*)calloc(1, sizeof(*c));
+        if (!c) return E_OUTOFMEMORY;
+        c->lpVtbl = &kCFVtbl; c->ref = 1;
+        *factory = (IActivationFactory*)c;
+        lg("[wifidirect]   -> PasswordCredential 工厂已创建");
+        return S_OK;
+    }
 
     int kind;
     if (_wcsicmp(raw, kClassName) == 0)
