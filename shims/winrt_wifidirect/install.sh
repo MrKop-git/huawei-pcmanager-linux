@@ -26,9 +26,32 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-CLASS='Windows.Devices.WiFiDirect.WiFiDirectAdvertisementPublisher'
-KEY="HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\$CLASS"
+# 本垫片实现的所有 WinRT 类。加类就往这里加一行 —— 用
+#   tools/collect-gaps.sh
+# 收运行期缺口（combase 会吐 "Failed to find library for L\"...\""）
+CLASSES=(
+  # —— 真正实现了行为的 ——
+  'Windows.Devices.WiFiDirect.WiFiDirectAdvertisementPublisher'
+  'Windows.Devices.WiFiDirect.WiFiDirectConnectionListener'
+  # —— 只给骨架（上层会拿到 E_NOINTERFACE 并走自己的错误分支）——
+  'Windows.Devices.Bluetooth.Advertisement.BluetoothLEAdvertisementPublisher'
+  'Windows.Devices.Bluetooth.Advertisement.BluetoothLEManufacturerData'
+  'Windows.Devices.Bluetooth.GenericAttributeProfile.GattServiceProvider'
+  'Windows.Devices.Bluetooth.GenericAttributeProfile.GattSession'
+  'Windows.Devices.Bluetooth.GenericAttributeProfile.GattLocalCharacteristic'
+  'Windows.Devices.Bluetooth.GenericAttributeProfile.GattLocalCharacteristicParameters'
+  'Windows.Devices.Bluetooth.GenericAttributeProfile.GattServiceProviderAdvertisingParameters'
+  'Windows.Devices.WiFiDirect.WiFiDirectDevice'
+  'Windows.Networking.Connectivity.NetworkInformation'
+  'Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager'
+  'Windows.Security.Credentials.PasswordCredential'
+  'Windows.Security.Credentials.PasswordVault'
+  'Windows.Storage.Streams.DataReader'
+  'Windows.Storage.Streams.DataWriter'
+)
 DLL_NAME='windows.devices.wifidirect.dll'
+
+class_key() { echo "HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\$1"; }
 
 [ -n "$PREFIX_ARG" ] || { echo "必须给 --prefix"; exit 1; }
 PREFIX="$(readlink -f "${PREFIX_ARG/#\~/$HOME}")"
@@ -36,9 +59,11 @@ export WINEPREFIX="$PREFIX"
 [ -d "$PREFIX/drive_c" ] || { echo "不是有效的 Wine 前缀: $PREFIX"; exit 1; }
 
 if [ "$UNINSTALL" = 1 ]; then
-  wine reg delete "$KEY" /f 2>/dev/null || true
+  for c in "${CLASSES[@]}"; do
+    wine reg delete "$(class_key "$c")" /f >/dev/null 2>&1 || true
+  done
   rm -f "$PREFIX/drive_c/windows/system32/$DLL_NAME"
-  echo "已注销 $CLASS 并删除 DLL"
+  echo "已注销 ${#CLASSES[@]} 个类并删除 DLL"
   exit 0
 fi
 
@@ -46,18 +71,24 @@ SRC="$HERE/windows.devices.wifidirect-x64.dll"
 [ -f "$SRC" ] || { echo "先跑 ./build.sh"; exit 1; }
 
 echo "==> 部署 DLL"
-for d in system32 "../../Program Files/Huawei/PCManager" "../../Program Files/Huawei/Hiview"; do
-  t="$PREFIX/drive_c/windows/$d"
-  mkdir -p "$t" 2>/dev/null || true
-done
 cp -f "$SRC" "$PREFIX/drive_c/windows/system32/$DLL_NAME"
 echo "  -> C:\\windows\\system32\\$DLL_NAME"
 
-echo "==> 注册 WinRT 类"
-wine reg add "$KEY" /v DllPath /t REG_SZ /d "C:\\windows\\system32\\$DLL_NAME" /f 2>&1 | tail -1
+echo "==> 注册 ${#CLASSES[@]} 个 WinRT 类"
+for c in "${CLASSES[@]}"; do
+  wine reg add "$(class_key "$c")" /v DllPath /t REG_SZ \
+       /d "C:\\windows\\system32\\$DLL_NAME" /f >/dev/null 2>&1
+  printf '  %s\n' "$c"
+done
 
 echo "==> 核对"
-wine reg query "$KEY" 2>/dev/null | sed 's/^/  /'
+for c in "${CLASSES[@]}"; do
+  if wine reg query "$(class_key "$c")" >/dev/null 2>&1; then
+    printf '  ✅ %s\n' "$c"
+  else
+    printf '  ❌ %s\n' "$c"
+  fi
+done
 
 cat <<EOF
 

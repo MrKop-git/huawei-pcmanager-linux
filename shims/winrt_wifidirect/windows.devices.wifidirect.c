@@ -73,6 +73,14 @@ static const GUID kIID_IWifiDirectAdvertisement = {
     0xAB511A2D, 0x2A06, 0x49A1, { 0xA5, 0x84, 0x61, 0x43, 0x5C, 0x79, 0x05, 0xA6 } };
 static const GUID kIID_IWifiDirectLegacySettings = {
     0xA64FDBBA, 0xF2FD, 0x4567, { 0xA9, 0x1B, 0xF5, 0xC2, 0xF5, 0x32, 0x10, 0x57 } };
+static const GUID kIID_IWifiDirectConnectionListener = {
+    0x699C1B0D, 0x8D13, 0x4EE9, { 0xB9, 0xEC, 0x9C, 0x72, 0xF8, 0x25, 0x1F, 0x7D } };
+/* 备用（将来要真回调"有设备请求连接"时会用到）：
+ *   IWiFiDirectConnectionRequestedEventArgs = {F99D20BE-D38D-484F-8215-E7B65ABF244C} */
+
+/* 本垫片认识的两个 runtime class */
+static const WCHAR kClassNameConnListener[] =
+    L"Windows.Devices.WiFiDirect.WiFiDirectConnectionListener";
 
 static const WCHAR kClassName[] =
     L"Windows.Devices.WiFiDirect.WiFiDirectAdvertisementPublisher";
@@ -108,15 +116,6 @@ static void wide_to_ascii(const WCHAR *w, char *dst, size_t cap)
     for (; w && *w && i + 1 < cap; ++w)
         dst[i++] = (*w >= 0x20 && *w < 0x7F) ? (char)*w : '_';
     dst[i] = 0;
-}
-
-/* 读一个 HSTRING 参数 */
-static void hstr_to_ascii(HSTRING h, char *dst, size_t cap)
-{
-    UINT32 n = 0;
-    const WCHAR *raw = h ? WindowsGetStringRawBuffer(h, &n) : NULL;
-    dst[0] = 0;
-    if (raw) wide_to_ascii(raw, dst, cap);
 }
 
 /* 把动作发给 wlanapi-shimd（复用已有的文件协议） */
@@ -366,16 +365,16 @@ typedef struct Publisher {
 } Publisher;
 
 typedef struct PublisherVtbl {
-    /* IInspectable */
+    /* IInspectable（6 槽） */
     HRESULT (STDMETHODCALLTYPE *QueryInterface)(Publisher*, REFIID, void**);
     ULONG   (STDMETHODCALLTYPE *AddRef)(Publisher*);
     ULONG   (STDMETHODCALLTYPE *Release)(Publisher*);
     HRESULT (STDMETHODCALLTYPE *GetIids)(Publisher*, ULONG*, IID**);
     HRESULT (STDMETHODCALLTYPE *GetRuntimeClassName)(Publisher*, HSTRING*);
     HRESULT (STDMETHODCALLTYPE *GetTrustLevel)(Publisher*, TrustLevel*);
-    /* IActivationFactory */
-    HRESULT (STDMETHODCALLTYPE *ActivateInstance)(Publisher*, void**);
-    /* IWiFiDirectAdvertisementPublisher */
+    /* ★ 紧接着就是 IWiFiDirectAdvertisementPublisher 的 6 个方法。
+     *   中间**不许**再插任何东西 —— 工厂是另一个对象（见下面的 Factory）。
+     *   （踩过：原先把 ActivateInstance 插在这里，导致整个接口错一位。） */
     HRESULT (STDMETHODCALLTYPE *get_Advertisement)(Publisher*, void**);
     HRESULT (STDMETHODCALLTYPE *get_Status)(Publisher*, INT32*);
     HRESULT (STDMETHODCALLTYPE *add_StatusChanged)(Publisher*, void*, EventRegistrationToken*);
@@ -389,8 +388,8 @@ static ULONG PB_AddRef(Publisher *s);       /* PB_QI 里要用，先声明 */
 static HRESULT PB_QI(Publisher *s, REFIID iid, void **o)
 {
     if (!o) return E_POINTER;
-    if (IsEqualGUID(iid, &kIID_IWifiDirectAdvertisementPublisher)
-     || IsEqualGUID(iid, &kIID_IActivationFactory)) {
+    /* 只认自己的接口；IActivationFactory 归工厂对象管，不在这里认领 */
+    if (IsEqualGUID(iid, &kIID_IWifiDirectAdvertisementPublisher)) {
         PB_AddRef(s); *o = s; return S_OK;
     }
     return rt_QI(iid, &kIID_IWifiDirectAdvertisementPublisher, s, o);
@@ -401,15 +400,6 @@ static ULONG PB_Release(Publisher *s) { return rt_Release(s, PB_dtor); }
 static HRESULT PB_GetIids(Publisher *s, ULONG *n, IID **i) { (void)s; return rt_GetIids(&kIID_IWifiDirectAdvertisementPublisher, n, i); }
 static HRESULT PB_GetRCN(Publisher *s, HSTRING *h) { (void)s; return rt_GetRuntimeClassName(h); }
 static HRESULT PB_GetTL(Publisher *s, TrustLevel *t) { (void)s; if(t)*t=BaseTrust; return S_OK; }
-
-static HRESULT PB_ActivateInstance(Publisher *s, void **out)
-{
-    if (!out) return E_POINTER;
-    PB_AddRef(s);          /* 复用同一个对象作为实例 —— 语义上够用 */
-    *out = s;
-    lg("[wifidirect] ActivateInstance");
-    return S_OK;
-}
 
 static HRESULT PB_get_Advertisement(Publisher *s, void **v)
 {
@@ -450,11 +440,232 @@ static HRESULT PB_Stop(Publisher *s)
 
 static const PublisherVtbl kPBVtbl = {
     PB_QI, PB_AddRef, PB_Release, PB_GetIids, PB_GetRCN, PB_GetTL,
-    PB_ActivateInstance,
     PB_get_Advertisement, PB_get_Status,
     PB_add_StatusChanged, PB_remove_StatusChanged,
     PB_Start, PB_Stop,
 };
+
+static Publisher *Publisher_new(void)
+{
+    Publisher *s = (Publisher*)calloc(1, sizeof(*s));
+    if (s) { s->lpVtbl = &kPBVtbl; s->ref = 1; s->adv = Advertisement_new(); s->status = 0; }
+    return s;
+}
+
+/* =================================================================
+ * IWiFiDirectConnectionListener  {699C1B0D-...}
+ *   add_ConnectionRequested  remove_ConnectionRequested
+ *
+ * 程序用它监听"手机来连了"。我们注册回调但**不会真的回调** ——
+ * 真回调要等后面把"有设备接入"从 Linux 侧（hostapd 的客户端列表 / BlueZ）接上来。
+ * ================================================================= */
+
+typedef struct ConnListener {
+    RT_HEAD
+    int dummy;
+} ConnListener;
+
+typedef struct ConnListenerVtbl {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(ConnListener*, REFIID, void**);
+    ULONG   (STDMETHODCALLTYPE *AddRef)(ConnListener*);
+    ULONG   (STDMETHODCALLTYPE *Release)(ConnListener*);
+    HRESULT (STDMETHODCALLTYPE *GetIids)(ConnListener*, ULONG*, IID**);
+    HRESULT (STDMETHODCALLTYPE *GetRuntimeClassName)(ConnListener*, HSTRING*);
+    HRESULT (STDMETHODCALLTYPE *GetTrustLevel)(ConnListener*, TrustLevel*);
+    HRESULT (STDMETHODCALLTYPE *add_ConnectionRequested)(ConnListener*, void*, EventRegistrationToken*);
+    HRESULT (STDMETHODCALLTYPE *remove_ConnectionRequested)(ConnListener*, EventRegistrationToken);
+} ConnListenerVtbl;
+
+static HRESULT CL_QI(ConnListener *s, REFIID iid, void **o)
+{
+    if (!o) return E_POINTER;
+    if (IsEqualGUID(iid, &kIID_IWifiDirectConnectionListener)) { rt_AddRef(s); *o = s; return S_OK; }
+    return rt_QI(iid, &kIID_IWifiDirectConnectionListener, s, o);
+}
+static ULONG CL_AddRef(ConnListener *s) { return rt_AddRef(s); }
+static ULONG CL_Release(ConnListener *s) { return rt_Release(s, free); }
+static HRESULT CL_GetIids(ConnListener *s, ULONG *n, IID **i)
+{ (void)s; return rt_GetIids(&kIID_IWifiDirectConnectionListener, n, i); }
+static HRESULT CL_GetRCN(ConnListener *s, HSTRING *h)
+{ (void)s; return h ? WindowsCreateString(kClassNameConnListener,
+                                          (UINT32)wcslen(kClassNameConnListener), h) : E_POINTER; }
+static HRESULT CL_GetTL(ConnListener *s, TrustLevel *t) { (void)s; if(t)*t=BaseTrust; return S_OK; }
+
+static HRESULT CL_add_CR(ConnListener *s, void *h, EventRegistrationToken *t)
+{ (void)s;(void)h; lg("[wifidirect] ConnectionListener::add_ConnectionRequested（已记下，暂不回调）"); return rt_token(t); }
+static HRESULT CL_remove_CR(ConnListener *s, EventRegistrationToken t) { (void)s;(void)t; return S_OK; }
+
+static const ConnListenerVtbl kCLVtbl = {
+    CL_QI, CL_AddRef, CL_Release, CL_GetIids, CL_GetRCN, CL_GetTL,
+    CL_add_CR, CL_remove_CR,
+};
+
+/* =================================================================
+ * 激活工厂（IActivationFactory）
+ *
+ * ★ 工厂和实例是两个对象：工厂只有 IInspectable + ActivateInstance，
+ *   实例才带具体接口的方法。混在一个对象里会让实例的接口整体错位。
+ * ================================================================= */
+
+/* =================================================================
+ * 通用兜底对象
+ *
+ * 程序引用的 WinRT 类比 Wine 实现的多得多（光 HiConnectivityService 就还缺
+ * 9 个）。一个个实现既慢又没必要 —— 其中有些在本次执行的路径上根本不会被激活。
+ *
+ * 兜底的语义：**类找得到、实例给得出，但具体接口一律 E_NOINTERFACE**。
+ * 这样上层走它自己的错误分支（大多数 WinRT 代码都会查 HRESULT），
+ * 而不是整条链断在 combase 的 "Failed to find library"。
+ *
+ * 这正是"先用运行期日志把真正要紧的挑出来"的手段 —— 谁真的被 QI 了，
+ * 日志里看得见，再去把它实现完整。
+ * ================================================================= */
+
+typedef struct StubObj { RT_HEAD } StubObj;
+
+typedef struct StubVtbl {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(StubObj*, REFIID, void**);
+    ULONG   (STDMETHODCALLTYPE *AddRef)(StubObj*);
+    ULONG   (STDMETHODCALLTYPE *Release)(StubObj*);
+    HRESULT (STDMETHODCALLTYPE *GetIids)(StubObj*, ULONG*, IID**);
+    HRESULT (STDMETHODCALLTYPE *GetRuntimeClassName)(StubObj*, HSTRING*);
+    HRESULT (STDMETHODCALLTYPE *GetTrustLevel)(StubObj*, TrustLevel*);
+} StubVtbl;
+
+static HRESULT ST_QI(StubObj *s, REFIID iid, void **o)
+{
+    if (!o) return E_POINTER;
+    static const GUID iid_unk = {0,0,0,{0xC0,0,0,0,0,0,0,0x46}};
+    static const GUID iid_ins = {0xAF86E2E0,0xB12D,0x4C6A,{0x9C,0x5A,0xD7,0xAA,0x65,0x10,0x1E,0x90}};
+    if (IsEqualGUID(iid, &iid_unk) || IsEqualGUID(iid, &iid_ins)) { rt_AddRef(s); *o = s; return S_OK; }
+    char nm[64]; snprintf(nm, sizeof(nm), "{%08lX-%04X-%04X-...}",
+                          (unsigned long)iid->Data1, iid->Data2, iid->Data3);
+    lg("[wifidirect] 兜底对象被 QI 一个未实现的接口 %s -> E_NOINTERFACE", nm);
+    *o = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG ST_AddRef(StubObj *s) { return rt_AddRef(s); }
+static ULONG ST_Release(StubObj *s) { return rt_Release(s, free); }
+static HRESULT ST_GetIids(StubObj *s, ULONG *n, IID **i)
+{ (void)s; if(n)*n=0; if(i)*i=NULL; return S_OK; }
+static HRESULT ST_GetRCN(StubObj *s, HSTRING *h)
+{ (void)s; if(!h) return E_POINTER; return WindowsCreateString(kClassName, (UINT32)wcslen(kClassName), h); }
+static HRESULT ST_GetTL(StubObj *s, TrustLevel *t) { (void)s; if(t)*t=BaseTrust; return S_OK; }
+
+static const StubVtbl kSTVtbl = {
+    ST_QI, ST_AddRef, ST_Release, ST_GetIids, ST_GetRCN, ST_GetTL,
+};
+
+enum { KIND_PUBLISHER = 0, KIND_CONNLISTENER = 1, KIND_STUB = 2 };
+
+typedef struct Factory {
+    RT_HEAD
+    int kind;
+} Factory;
+
+typedef struct FactoryVtbl {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(Factory*, REFIID, void**);
+    ULONG   (STDMETHODCALLTYPE *AddRef)(Factory*);
+    ULONG   (STDMETHODCALLTYPE *Release)(Factory*);
+    HRESULT (STDMETHODCALLTYPE *GetIids)(Factory*, ULONG*, IID**);
+    HRESULT (STDMETHODCALLTYPE *GetRuntimeClassName)(Factory*, HSTRING*);
+    HRESULT (STDMETHODCALLTYPE *GetTrustLevel)(Factory*, TrustLevel*);
+    HRESULT (STDMETHODCALLTYPE *ActivateInstance)(Factory*, void**);
+} FactoryVtbl;
+
+static HRESULT FW_QI(Factory *s, REFIID iid, void **o)
+{
+    if (!o) return E_POINTER;
+    if (IsEqualGUID(iid, &kIID_IActivationFactory)) { rt_AddRef(s); *o = s; return S_OK; }
+    static const GUID iid_unk = {0,0,0,{0xC0,0,0,0,0,0,0,0x46}};
+    static const GUID iid_ins = {0xAF86E2E0,0xB12D,0x4C6A,{0x9C,0x5A,0xD7,0xAA,0x65,0x10,0x1E,0x90}};
+    if (IsEqualGUID(iid, &iid_unk) || IsEqualGUID(iid, &iid_ins)) { rt_AddRef(s); *o = s; return S_OK; }
+    *o = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG FW_AddRef(Factory *s) { return rt_AddRef(s); }
+static ULONG FW_Release(Factory *s) { return rt_Release(s, free); }
+static HRESULT FW_GetIids(Factory *s, ULONG *n, IID **i)
+{ (void)s; return rt_GetIids(&kIID_IActivationFactory, n, i); }
+static HRESULT FW_GetRCN(Factory *s, HSTRING *h) { (void)s; return rt_GetRuntimeClassName(h); }
+static HRESULT FW_GetTL(Factory *s, TrustLevel *t) { (void)s; if(t)*t=BaseTrust; return S_OK; }
+
+static HRESULT FW_ActivateInstance(Factory *s, void **out)
+{
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (s->kind == KIND_PUBLISHER) {
+        Publisher *p = Publisher_new();
+        if (!p) return E_OUTOFMEMORY;
+        *out = p;
+        lg("[wifidirect] ActivateInstance -> Publisher");
+    } else if (s->kind == KIND_CONNLISTENER) {
+        ConnListener *c = (ConnListener*)calloc(1, sizeof(*c));
+        if (!c) return E_OUTOFMEMORY;
+        c->lpVtbl = &kCLVtbl; c->ref = 1;
+        *out = c;
+        lg("[wifidirect] ActivateInstance -> ConnectionListener");
+    } else {
+        StubObj *o = (StubObj*)calloc(1, sizeof(*o));
+        if (!o) return E_OUTOFMEMORY;
+        o->lpVtbl = &kSTVtbl; o->ref = 1;
+        *out = o;
+        lg("[wifidirect] ActivateInstance -> 兜底对象（未实现该类的行为）");
+    }
+    return S_OK;
+}
+
+static const FactoryVtbl kFWVtbl = {
+    FW_QI, FW_AddRef, FW_Release, FW_GetIids, FW_GetRCN, FW_GetTL,
+    FW_ActivateInstance,
+};
+
+static Factory *Factory_new(int kind)
+{
+    Factory *f = (Factory*)calloc(1, sizeof(*f));
+    if (f) { f->lpVtbl = &kFWVtbl; f->ref = 1; f->kind = kind; }
+    return f;
+}
+
+/* =================================================================
+ * 只给骨架、暂不实现行为的类
+ *
+ * 来源：tools/collect-gaps.sh 的运行期缺口 + 逐 exe 的 UTF-16 字符串扫
+ * （**逐 exe 扫**才干净；扫整个目录会带进 SDK 元数据，实测噪声大两个量级）。
+ *
+ * 这份清单会随程序"走得更远"而增长 —— 每补一个类，它就露出下一层。
+ * 加类只需在这里加一行 + 在 install.sh 的 CLASSES 里加一行。
+ * ================================================================= */
+
+static const WCHAR *const kStubClasses[] = {
+    /* 蓝牙：GATT 服务端 / 广播发布 —— 让手机发现并连上来 */
+    L"Windows.Devices.Bluetooth.Advertisement.BluetoothLEAdvertisementPublisher",
+    L"Windows.Devices.Bluetooth.Advertisement.BluetoothLEManufacturerData",
+    L"Windows.Devices.Bluetooth.GenericAttributeProfile.GattServiceProvider",
+    L"Windows.Devices.Bluetooth.GenericAttributeProfile.GattSession",
+    L"Windows.Devices.Bluetooth.GenericAttributeProfile.GattLocalCharacteristicParameters",
+    L"Windows.Devices.Bluetooth.GenericAttributeProfile.GattLocalCharacteristic",
+    L"Windows.Devices.Bluetooth.GenericAttributeProfile.GattServiceProviderAdvertisingParameters",
+    /* Wi-Fi Direct 设备对象 */
+    L"Windows.Devices.WiFiDirect.WiFiDirectDevice",
+    /* 网络状态 / 热点管理 —— "开热点让手机连"要用的 */
+    L"Windows.Networking.Connectivity.NetworkInformation",
+    L"Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager",
+    /* 凭据存储（账号密码） */
+    L"Windows.Security.Credentials.PasswordCredential",
+    L"Windows.Security.Credentials.PasswordVault",
+    /* 数据读写 */
+    L"Windows.Storage.Streams.DataReader",
+    L"Windows.Storage.Streams.DataWriter",
+    NULL
+};
+
+static int is_stub_class(const WCHAR *name)
+{
+    for (int i = 0; kStubClasses[i]; ++i)
+        if (_wcsicmp(name, kStubClasses[i]) == 0) return 1;
+    return 0;
+}
 
 /* =================================================================
  * 导出
@@ -471,20 +682,24 @@ HRESULT WINAPI DllGetActivationFactory(HSTRING className, IActivationFactory **f
     if (raw) wide_to_ascii(raw, name, sizeof(name));
     lg("[wifidirect] DllGetActivationFactory(\"%s\")", name);
 
-    if (!raw || _wcsicmp(raw, kClassName) != 0) {
+    if (!raw) return CLASS_E_CLASSNOTAVAILABLE;
+
+    int kind;
+    if (_wcsicmp(raw, kClassName) == 0)
+        kind = KIND_PUBLISHER;
+    else if (_wcsicmp(raw, kClassNameConnListener) == 0)
+        kind = KIND_CONNLISTENER;
+    else if (is_stub_class(raw))
+        kind = KIND_STUB;          /* 类找得到，行为留白 —— 见文件里"通用兜底"一节 */
+    else {
         lg("[wifidirect]   -> 不是我的类，返回 CLASS_E_CLASSNOTAVAILABLE");
         return CLASS_E_CLASSNOTAVAILABLE;
     }
 
-    Publisher *p = (Publisher*)calloc(1, sizeof(*p));
-    if (!p) return E_OUTOFMEMORY;
-    p->lpVtbl = &kPBVtbl;
-    p->ref = 1;
-    p->adv = Advertisement_new();
-    p->status = 0;                        /* Stopped */
-
-    *factory = (IActivationFactory*)p;
-    lg("[wifidirect]   -> 工厂已创建");
+    Factory *f = Factory_new(kind);
+    if (!f) return E_OUTOFMEMORY;
+    *factory = (IActivationFactory*)f;
+    lg("[wifidirect]   -> 工厂已创建 (kind=%d)", kind);
     return S_OK;
 }
 
