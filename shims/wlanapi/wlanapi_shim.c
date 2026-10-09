@@ -794,12 +794,19 @@ DWORD WINAPI WlanIhvControl(HANDLE hClientHandle, const GUID *pInterfaceGuid,
 
 /* ------------------------------------------------------------ DllMain */
 
+/* 服务 exe 的 SCDW 崩塌绕不过去，见 scdw_hook.c 顶部说明。
+ * 我们这份 DLL 一定在它的 main() 之前被加载（依赖链 HiConnectivitySDK → wlanapi），
+ * 所以在这里顺手把它的 IAT 钩上。 */
+void scdw_hook_install(void);
+
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 {
     (void)hinstDLL; (void)lpvReserved;
     switch (fdwReason) {
     case DLL_PROCESS_ATTACH:
+        DisableThreadLibraryCalls(hinstDLL);
         LOG("==== wlanapi 垫片加载 (pid=%lu) ====", (unsigned long)GetCurrentProcessId());
+        scdw_hook_install();       /* 只对点名的主模块生效，其他进程空转 */
         break;
     case DLL_PROCESS_DETACH:
         LOG("==== wlanapi 垫片卸载 ====");

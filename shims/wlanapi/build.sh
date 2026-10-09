@@ -62,7 +62,7 @@ build() {  # $1=前缀 $2=输出名
   command -v "$cc" >/dev/null || { echo "缺 $cc"; return 1; }
   gen_def "$def"
   "$cc" -O2 -shared -Wall -Wextra -Wno-unused-parameter \
-        -o "$out" wlanapi_shim.c "$def" \
+        -o "$out" wlanapi_shim.c scdw_hook.c "$def" \
         -lole32 -ladvapi32 -static-libgcc
   echo "  -> $out  ($(stat -c %s "$out") 字节)"
 }
