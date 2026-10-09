@@ -33,6 +33,7 @@
 #include <string.h>
 #include <wchar.h>
 #include <stdarg.h>
+#include <errno.h>
 
 /* ---------------------------------------------------------------
  * mingw 的 wlanapi.h 里**完全没有 Hosted Network 段**（实测 0 处声明），
@@ -108,6 +109,18 @@ typedef enum _WLAN_HOSTED_NETWORK_OPCODE {
     wlan_hosted_network_opcode_enable
 } WLAN_HOSTED_NETWORK_OPCODE, *PWLAN_HOSTED_NETWORK_OPCODE;
 
+/* 上层用 SetProperty(opcode=connection_settings) 把 SSID 告诉我们 —— 这就是
+ * 手机要连的那个热点名。 */
+typedef struct _WLAN_HOSTED_NETWORK_CONNECTION_SETTINGS {
+    DOT11_SSID dot11Ssid;
+    DWORD      dwMaxNumberOfPeers;
+} WLAN_HOSTED_NETWORK_CONNECTION_SETTINGS, *PWLAN_HOSTED_NETWORK_CONNECTION_SETTINGS;
+
+typedef struct _WLAN_HOSTED_NETWORK_SECURITY_SETTINGS {
+    DOT11_AUTH_ALGORITHM dot11AuthAlgo;
+    DOT11_CIPHER_ALGORITHM dot11CipherAlgo;
+} WLAN_HOSTED_NETWORK_SECURITY_SETTINGS, *PWLAN_HOSTED_NETWORK_SECURITY_SETTINGS;
+
 #endif /* WLANAPI_SHIM_HOSTED_NETWORK_TYPES */
 
 /* ---------------------------------------------------------------- 日志 */
@@ -136,6 +149,146 @@ static void logf_(const char *fmt, ...)
 }
 
 #define LOG(...) logf_(__VA_ARGS__)
+
+/* =================================================================
+ * Linux 侧后端（wlanapi-shimd）客户端
+ *
+ * 通信走文件，不走 IPC —— 好处是 Linux 那半可以完全独立测试，
+ * 不用每次都把整个 Windows 进程树拉起来（Wine 调试一轮要几十秒）。
+ *
+ *   C:\wlanapi_shim\req.json     我们写 → shimd 读
+ *   C:\wlanapi_shim\status.json  shimd 写 → 我们读
+ * ================================================================= */
+
+#define SHIM_COMM_DIR   "C:\\wlanapi_shim"
+#define SHIM_REQ_PATH   SHIM_COMM_DIR "\\req.json"
+#define SHIM_STS_PATH   SHIM_COMM_DIR "\\status.json"
+
+/* 上层通过 WlanHostedNetworkSetProperty / SetSecondaryKey 告诉我们的参数，
+ * 攒着，到 ForceStart 时一起发给后端。 */
+static char g_ssid[64] = {0};
+static char g_key[128] = {0};
+static int  g_have_ssid = 0, g_have_key = 0;
+
+/* 只保留可打印 ASCII；其余替换成 '_'（SSID/口令要写进 hostapd 配置） */
+static void sanitize_ascii(const char *src, char *dst, size_t cap)
+{
+    size_t i = 0;
+    if (!cap) return;
+    for (; src && *src && i + 1 < cap; ++src) {
+        unsigned char c = (unsigned char)*src;
+        if (c == '"' || c == '\\') dst[i++] = '_';        /* 别破坏 JSON */
+        else if (c >= 0x20 && c < 0x7F) dst[i++] = (char)c;
+        else dst[i++] = '_';
+    }
+    dst[i] = 0;
+}
+
+/* 把宽字符 SSID / 口令转成 UTF-8（hostapd 的 ssid= 接受 UTF-8） */
+static void wide_to_ascii(const WCHAR *w, char *dst, size_t cap)
+{
+    size_t i = 0;
+    if (!cap) return;
+    for (; w && *w && i + 1 < cap; ++w) {
+        WCHAR c = *w;
+        dst[i++] = (c >= 0x20 && c < 0x7F) ? (char)c : '_';
+    }
+    dst[i] = 0;
+}
+
+static unsigned g_seq = 0;
+
+/* 写请求。action: start / stop / status / capability */
+static int backend_req(const char *action)
+{
+    CreateDirectoryA(SHIM_COMM_DIR, NULL);   /* 已存在就失败，无所谓 */
+    FILE *f = fopen(SHIM_REQ_PATH, "wb");
+    if (!f) {
+        LOG("[shim] !! 写不了 %s（errno=%d）—— shimd 装了吗？", SHIM_REQ_PATH, errno);
+        return 0;
+    }
+    ++g_seq;
+    fprintf(f, "{\"seq\":%u,\"action\":\"%s\",\"ssid\":\"%s\",\"key\":\"%s\"}\n",
+            g_seq, action, g_ssid, g_key);
+    fclose(f);
+    LOG("[shim] -> req seq=%u action=%s ssid=\"%s\" keyLen=%zu",
+        g_seq, action, g_ssid, strlen(g_key));
+    return 1;
+}
+
+/* 从 status.json 里抠出我们要的字段。是个小程序内部协议，不值得上 JSON 解析器。 */
+static void json_str(const char *buf, const char *key, char *out, size_t cap)
+{
+    out[0] = 0;
+    char pat[64];
+    _snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(buf, pat);
+    if (!p) return;
+    p = strchr(p + strlen(pat), ':');
+    if (!p) return;
+    ++p;
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p != '"') return;
+    ++p;
+    size_t i = 0;
+    for (; *p && *p != '"' && i + 1 < cap; ++p)
+        out[i++] = (*p == '\\' && p[1]) ? *++p : *p;
+    out[i] = 0;
+}
+
+static int json_bool(const char *buf, const char *key)
+{
+    char pat[64];
+    _snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(buf, pat);
+    if (!p) return -1;
+    p = strchr(p + strlen(pat), ':');
+    if (!p) return -1;
+    ++p;
+    while (*p == ' ' || *p == '\t') ++p;
+    if (!strncmp(p, "true", 4))  return 1;
+    if (!strncmp(p, "false", 5)) return 0;
+    return -1;
+}
+
+/* 读后端状态。返回 1 表示读到了。 */
+static int backend_status(char *state, size_t scap, char *detail, size_t dcap, int *ok)
+{
+    if (state && scap)  state[0] = 0;
+    if (detail && dcap) detail[0] = 0;
+    if (ok) *ok = -1;
+
+    FILE *f = fopen(SHIM_STS_PATH, "rb");
+    if (!f) return 0;
+    char buf[1024];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = 0;
+
+    if (state)  json_str(buf, "state",  state,  scap);
+    if (detail) json_str(buf, "detail", detail, dcap);
+    if (ok)     *ok = json_bool(buf, "ok");
+    return 1;
+}
+
+/* 等后端把这次请求的结果写回来（最多 ms 毫秒）。
+ * shimd 是轮询的，0.5s 一次，所以给 3 秒余量。 */
+static int backend_wait(char *state, size_t scap, char *detail, size_t dcap, int *ok, int ms)
+{
+    unsigned want = g_seq;
+    for (int waited = 0; waited <= ms; waited += 200) {
+        if (backend_status(state, scap, detail, dcap, ok)) {
+            /* 简单起见：只要能读到就算这轮结果（shimd 每次都会覆盖写） */
+            return 1;
+        }
+        Sleep(200);
+    }
+    if (state && scap)  strcpy(state, "unavailable");
+    if (detail && dcap) strcpy(detail, "后端没响应（wlanapi-shimd 没在跑？）");
+    if (ok) *ok = 0;
+    LOG("[shim] !! 等后端超时（seq=%u, %d ms）", want, ms);
+    return 0;
+}
 
 /* ------------------------------------------------------------ 假句柄 */
 
@@ -424,8 +577,19 @@ DWORD WINAPI WlanDisconnect(HANDLE hClientHandle, const GUID *pInterfaceGuid, PV
 DWORD WINAPI WlanHostedNetworkInitSettings(HANDLE hClientHandle, PVOID pReserved,
                                            PWLAN_HOSTED_NETWORK_REASON pFailReason)
 {
-    LOG("[shim] WlanHostedNetworkInitSettings() -> 假装失败（暂无 SoftAP 后端）");
-    if (pFailReason) *pFailReason = wlan_hosted_network_reason_unsupported;
+    /* 问后端网卡到底支不支持开热点。支持就报成功，让上层继续往下走。 */
+    char state[64], detail[256];
+    int ok = -1;
+    backend_req("capability");
+    backend_wait(state, sizeof(state), detail, sizeof(detail), &ok, 3000);
+
+    if (ok == 1) {
+        LOG("[shim] WlanHostedNetworkInitSettings() -> OK (%s)", detail);
+        if (pFailReason) *pFailReason = wlan_hosted_network_reason_success;
+    } else {
+        LOG("[shim] WlanHostedNetworkInitSettings() -> 后端说不行: %s", detail);
+        if (pFailReason) *pFailReason = wlan_hosted_network_reason_unsupported;
+    }
     return ERROR_SUCCESS;
 }
 
@@ -436,10 +600,22 @@ DWORD WINAPI WlanHostedNetworkQueryStatus(HANDLE hClientHandle,
     if (!ppWlanHostedNetworkStatus) return ERROR_INVALID_PARAMETER;
     PWLAN_HOSTED_NETWORK_STATUS s = shim_alloc(sizeof(WLAN_HOSTED_NETWORK_STATUS));
     if (!s) return ERROR_NOT_ENOUGH_MEMORY;
-    s->wlanHostedNetworkState = wlan_hosted_network_unavailable;
-    s->dwNumberOfPeers = 0;   /* 其余由 calloc 清零 */
+
+    /* 状态以后端为准 —— 别撒谎，上层靠它判断链路是否真的建立了 */
+    char state[64] = {0}, detail[256] = {0};
+    int ok = -1;
+    backend_status(state, sizeof(state), detail, sizeof(detail), &ok);
+
+    if (!strcmp(state, "active"))
+        s->wlanHostedNetworkState = wlan_hosted_network_active;
+    else if (!strcmp(state, "idle"))
+        s->wlanHostedNetworkState = wlan_hosted_network_idle;
+    else
+        s->wlanHostedNetworkState = wlan_hosted_network_unavailable;
+
+    s->dwNumberOfPeers = 0;   /* TODO: 从 hostapd 的客户端列表里数真实上来的手机 */
     *ppWlanHostedNetworkStatus = s;
-    LOG("[shim] WlanHostedNetworkQueryStatus() -> unavailable");
+    LOG("[shim] WlanHostedNetworkQueryStatus() -> %s (%s)", state[0] ? state : "无后端", detail);
     return ERROR_SUCCESS;
 }
 
@@ -461,8 +637,25 @@ DWORD WINAPI WlanHostedNetworkSetProperty(HANDLE hClientHandle, WLAN_HOSTED_NETW
                                           DWORD dwDataSize, PVOID pvData,
                                           PWLAN_HOSTED_NETWORK_REASON pFailReason, PVOID pReserved)
 {
-    LOG("[shim] WlanHostedNetworkSetProperty(opcode=%d, %lu 字节) -> 假装成功",
-        (int)OpCode, (unsigned long)dwDataSize);
+    /* ★ 这里拿到手机要连的热点名（SSID）—— 整个链路的关键参数之一 */
+    if (OpCode == wlan_hosted_network_opcode_connection_settings
+        && pvData && dwDataSize >= sizeof(WLAN_HOSTED_NETWORK_CONNECTION_SETTINGS)) {
+        const WLAN_HOSTED_NETWORK_CONNECTION_SETTINGS *cs = pvData;
+        ULONG n = cs->dot11Ssid.uSSIDLength;
+        if (n > sizeof(cs->dot11Ssid.ucSSID)) n = sizeof(cs->dot11Ssid.ucSSID);
+
+        char raw[40] = {0};
+        memcpy(raw, cs->dot11Ssid.ucSSID, n);
+        sanitize_ascii(raw, g_ssid, sizeof(g_ssid));
+        g_have_ssid = (g_ssid[0] != 0);
+
+        LOG("[shim] WlanHostedNetworkSetProperty(connection_settings): SSID=\"%s\" (%lu 字节) "
+            "maxPeers=%lu", g_ssid, (unsigned long)n,
+            (unsigned long)cs->dwMaxNumberOfPeers);
+    } else {
+        LOG("[shim] WlanHostedNetworkSetProperty(opcode=%d, %lu 字节)",
+            (int)OpCode, (unsigned long)dwDataSize);
+    }
     if (pFailReason) *pFailReason = wlan_hosted_network_reason_success;
     return ERROR_SUCCESS;
 }
@@ -484,7 +677,17 @@ DWORD WINAPI WlanHostedNetworkSetSecondaryKey(HANDLE hClientHandle, DWORD dwKeyL
                                               PUCHAR pucKeyData, BOOL bIsPassPhrase, BOOL bPersistent,
                                               PWLAN_HOSTED_NETWORK_REASON pFailReason, PVOID pReserved)
 {
-    LOG("[shim] WlanHostedNetworkSetSecondaryKey(%lu 字节) -> 假装成功", (unsigned long)dwKeyLength);
+    /* ★ 这里拿到热点口令 —— 另一个关键参数。攒着，ForceStart 时一起发给后端。 */
+    if (pucKeyData && dwKeyLength) {
+        char raw[256] = {0};
+        DWORD n = dwKeyLength < sizeof(raw) - 1 ? dwKeyLength : (DWORD)(sizeof(raw) - 1);
+        memcpy(raw, pucKeyData, n);
+        if (bIsPassPhrase) sanitize_ascii(raw, g_key, sizeof(g_key));
+        else               wide_to_ascii((const WCHAR *)raw, g_key, sizeof(g_key));
+        g_have_key = (g_key[0] != 0);
+        LOG("[shim] WlanHostedNetworkSetSecondaryKey: 收到口令 %lu 字节 (isPassPhrase=%d) -> 已存",
+            (unsigned long)dwKeyLength, (int)bIsPassPhrase);
+    }
     if (pFailReason) *pFailReason = wlan_hosted_network_reason_success;
     return ERROR_SUCCESS;
 }
@@ -492,21 +695,46 @@ DWORD WINAPI WlanHostedNetworkSetSecondaryKey(HANDLE hClientHandle, DWORD dwKeyL
 DWORD WINAPI WlanHostedNetworkForceStart(HANDLE hClientHandle,
                                          PWLAN_HOSTED_NETWORK_REASON pFailReason, PVOID pReserved)
 {
-    LOG("[shim] WlanHostedNetworkForceStart() -> NOT_SUPPORTED（待接 hostapd）");
-    if (pFailReason) *pFailReason = wlan_hosted_network_reason_unsupported;
-    return ERROR_NOT_SUPPORTED;
+    /* ★ 真正的动作在这里：让 Linux 侧起 hostapd + 配 IP */
+    LOG("[shim] WlanHostedNetworkForceStart(): ssid=\"%s\" keySet=%d",
+        g_ssid, g_have_key);
+
+    if (!g_have_ssid) strcpy(g_ssid, "HUAWEI-PC");   /* 上层没给就兜个默认 */
+    if (!g_have_key) {
+        LOG("[shim] !! 没收到口令，后端会拒绝");
+    }
+
+    char state[64], detail[256];
+    int ok = -1;
+    backend_req("start");
+    backend_wait(state, sizeof(state), detail, sizeof(detail), &ok, 6000);
+
+    if (ok == 1 && !strcmp(state, "active")) {
+        if (pFailReason) *pFailReason = wlan_hosted_network_reason_success;
+        LOG("[shim] ForceStart -> 成功: %s", detail);
+        return ERROR_SUCCESS;
+    }
+
+    if (pFailReason) *pFailReason = wlan_hosted_network_reason_ap_start_failed;
+    LOG("[shim] ForceStart -> 失败: %s", detail);
+    return ERROR_NOT_SUPPORTED;   /* 如实报失败，别骗上层 */
 }
 
 DWORD WINAPI WlanHostedNetworkForceStop(HANDLE hClientHandle,
                                         PWLAN_HOSTED_NETWORK_REASON pFailReason, PVOID pReserved)
 {
-    LOG("[shim] WlanHostedNetworkForceStop()");
+    char state[64], detail[256];
+    int ok = -1;
+    backend_req("stop");
+    backend_wait(state, sizeof(state), detail, sizeof(detail), &ok, 5000);
+    LOG("[shim] WlanHostedNetworkForceStop() -> %s (%s)", state, detail);
     if (pFailReason) *pFailReason = wlan_hosted_network_reason_success;
     return ERROR_SUCCESS;
 }
 
 DWORD WINAPI WlanHostedNetworkStopUsing(HANDLE hClientHandle, PVOID pReserved)
 {
+    backend_req("stop");
     LOG("[shim] WlanHostedNetworkStopUsing()");
     return ERROR_SUCCESS;
 }

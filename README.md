@@ -22,11 +22,26 @@ Linux 上没有官方或成熟的替代方案——现有几条路都不通：
 ✅ 安装器在 Wine 里跑通（含 GUI）
 ✅ 电脑管家装好、主程序能启动、界面文字与透明度正常
 ✅ 服务能起来 —— 「我的设备」等页面从"点了没反应"变成正常加载
-⚠️ wlanapi 垫片是 v0.1 探路版：还不会真建网，因此还不能真连手机
+✅ wlanapi 垫片 + Linux 后端已打通：后端能查网卡 AP 能力、能按上层给的
+   SSID/口令起 hostapd、配 192.168.137.1/24
+⚠️ 端到端（真开热点 + 手机连上 + 多屏协同建链）还没验
 ```
 
-**当前瓶颈**：垫片让上层以为 Wi-Fi 可用（`WlanHostedNetwork*` 假装成功），
-但**真正的 SoftAP / Wi-Fi Direct 还没接到 Linux 原生**，所以多屏协同建立不了真实链路。
+### 架构
+
+```
+Wine 侧 (wlanapi.dll)                 Linux 侧 (wlanapi-shimd, systemd user)
+  WlanHostedNetworkSetProperty  ─┐
+    → 解出 SSID                   │  写 req.json
+  WlanHostedNetworkSetSecondaryKey│ ──────────────►  起 hostapd
+    → 解出口令                    │  读 status.json      ip addr add 192.168.137.1/24
+  WlanHostedNetworkForceStart   ─┘  ◄──────────────  写 status.json
+
+  WlanHostedNetworkQueryStatus → 以后端状态为准（不撒谎）
+```
+
+**通信走文件不走 IPC** —— 这样 Linux 那半可以完全独立测试，不用每次都把
+整个 Windows 进程树拉起来（Wine 调试一轮几十秒，能省就省）。
 
 ### 已经打掉的坑
 

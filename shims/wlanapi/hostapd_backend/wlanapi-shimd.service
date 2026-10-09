@@ -1,0 +1,31 @@
+[Unit]
+Description=wlanapi shim backend (Linux-native SoftAP for Wine apps)
+Documentation=https://github.com/MrKop-git/huawei-pcmanager-linux
+# 不依赖 network-online：它自己就要操作网卡，而且启动时网卡未必就绪
+After=default.target
+
+[Service]
+Type=simple
+# ★ 用 %h 展开家目录，不写死路径
+ExecStart=%h/.local/bin/wlanapi-shimd --prefix %h/pcm-wine
+Restart=on-failure
+RestartSec=3
+
+# 只给它必要的能力，不做全权 root
+#   CAP_NET_ADMIN  配 IP / 起 hostapd 需要
+#   CAP_NET_RAW    hostapd 走 nl80211 需要
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+
+# 收敛暴露面
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# 运行目录要可写（放配置、pid、日志）
+ReadWritePaths=%h/.wlanapi-shim
+# 通信目录在 Wine 前缀里，也要可写
+ReadWritePaths=%h/pcm-wine/drive_c/wlanapi_shim
+
+[Install]
+WantedBy=default.target
